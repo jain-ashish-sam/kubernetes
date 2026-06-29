@@ -1,0 +1,2 @@
+1. Find a better way to exec into container, (I don't like the current approach).
+2. Re-think about polling-timings, "eventually" & other timings in order to avoid flasky tests.
