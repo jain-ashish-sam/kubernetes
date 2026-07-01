@@ -101,6 +101,19 @@ func makeGUPodWithDownwardAPI(podName, containerName string, cpuRequest string) 
 										Resource:      "assigned.cpuset",
 									},
 								},
+								// To bypass a potential bug, The below resource will be removed in the future
+								// requests.cpu is added as a second item to ensure the DownwardAPI volume
+								// is not empty when assigned.cpuset is stripped by dropDisabledAssignedCpuset
+								// (when the DownwardAPIAssignedResources feature gate is OFF). Without this,
+								// the volume would be removed entirely, leaving the volumeMount orphaned.
+								{
+									Path: fmt.Sprintf("requests_cpu_%s", containerName),
+									ResourceFieldRef: &v1.ResourceFieldSelector{
+										ContainerName: containerName,
+										Resource:      "requests.cpu",
+										Divisor:       resource.MustParse("1"),
+									},
+								},
 							},
 						},
 					},
@@ -212,12 +225,27 @@ func verifyCpusetVisible(tCtx ktesting.TContext, config *rest.Config, pod *v1.Po
 
 // verifyCpusetNotVisible verifies that the assigned.cpuset value is NOT visible in the
 // DownwardAPI volume file inside the container (file should not exist or be empty).
+// It retries with Eventually because the kubelet may need time to reconcile the pod
+// after a restart (e.g., after a feature gate toggle).
 func verifyCpusetNotVisible(tCtx ktesting.TContext, config *rest.Config, pod *v1.Pod, containerName string) {
 	tCtx.Helper()
 	filePath := fmt.Sprintf("/podinfo/assigned_cpuset_%s", containerName)
-	output, err := execInContainer(tCtx, config, pod, containerName, "/bin/sh", "-c",
-		fmt.Sprintf("cat %s 2>&1 || true", filePath))
-	tCtx.ExpectNoError(err, "exec in container %s", containerName)
-	tCtx.Expect(strings.Contains(output, "No such file") || strings.TrimSpace(output) == "").To(gomega.BeTrue(),
-		"assigned_cpuset file should NOT exist or be empty when feature gate is OFF, got: %s", output)
+	tCtx.Eventually(func(tCtx ktesting.TContext) string {
+		output, err := execInContainer(tCtx, config, pod, containerName, "/bin/sh", "-c",
+			fmt.Sprintf("cat %s 2>&1 || true", filePath))
+		if err != nil {
+			// Kubelet may not have reconciled the pod yet after restart.
+			// Return a sentinel value that won't match the success condition,
+			// causing Eventually to retry.
+			tCtx.Logf("Error execing in container %s (will retry): %v", containerName, err)
+			return "__retry__"
+		}
+		return output
+	}).WithTimeout(2*time.Minute).Should(gomega.SatisfyAny(
+		gomega.ContainSubstring("No such file"),
+		gomega.And(
+			gomega.Not(gomega.ContainSubstring("__retry__")),
+			gomega.BeEmpty(),
+		),
+	), "assigned_cpuset file should NOT exist or be empty when feature gate is OFF")
 }

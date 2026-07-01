@@ -1,2 +1,3 @@
 1. Find a better way to exec into container, (I don't like the current approach).
 2. Re-think about polling-timings, "eventually" & other timings in order to avoid flasky tests.
+3. Todo: Skip the test when the run-environment doesn't have enough cpu's. Currently, 4 cpu's are required for Pod1, Pod2, Pod3 & k8s-Control Plane. But we don't need all the pods at a given time, need to think should we delete pods after certain stage.
