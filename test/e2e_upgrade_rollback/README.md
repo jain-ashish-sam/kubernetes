@@ -5,7 +5,7 @@ How to Run:
 # Build the binaries
 make WHAT='cmd/kube-apiserver cmd/kube-scheduler cmd/kube-controller-manager cmd/kube-proxy cmd/kubelet'
 # Run test
-test/e2e_cpu_scale_down_delay/run.sh go test ./test/e2e_cpu_scale_down_delay/ -run TestDownwardAPIAssignedResourcesRollback  -v
+test/e2e_upgrade_rollback/run.sh go test ./test/e2e_upgrade_rollback/feature_gate_toggle_test/ -run TestDownwardAPIAssignedResourcesRollback  -v
 ```
 
 This directory contains a testsuite with automatic upgrade/downgrade tests for

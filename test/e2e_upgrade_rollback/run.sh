@@ -14,10 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Setup script for running the feature gate cycle test locally.
+# Setup script for running the upgrade/rollback tests locally.
 # Usage:
 #   make WHAT='cmd/kube-apiserver cmd/kube-scheduler cmd/kube-controller-manager cmd/kube-proxy cmd/kubelet'
-#   test/e2e_cpu_scale_down_delay/run.sh go test ./test/e2e_cpu_scale_down_delay/ -run TestDownwardAPIAssignedResourcesRollback  -v
+#   test/e2e_upgrade_rollback/run.sh go test ./test/e2e_upgrade_rollback/feature_gate_toggle_test/ -run TestDownwardAPIAssignedResourcesRollback  -v
 
 set -ex
 

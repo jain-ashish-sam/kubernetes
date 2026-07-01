@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package e2ecpuscaledowndelay
+package e2eupgraderollback
 
 import (
 	"bytes"
@@ -34,10 +34,10 @@ import (
 	"k8s.io/kubernetes/test/utils/client-go/ktesting"
 )
 
-// repoRootDefault figures out whether an E2E suite is invoked in its directory (as in `go test ./test/e2e_node/e2e_cpu_scale_down_delay`),
+// RepoRootDefault figures out whether an E2E suite is invoked in its directory (as in `go test ./test/e2e_upgrade_rollback`),
 // directly in the root (as in `make test`), or somewhere deep inside
 // the _output directory.
-func repoRootDefault() string {
+func RepoRootDefault() string {
 	for i := range 10 {
 		path := "." + strings.Repeat("/..", i)
 		if _, err := os.Stat(path + "/test/e2e/framework"); err == nil {
@@ -48,18 +48,18 @@ func repoRootDefault() string {
 	return "../../"
 }
 
-// currentBinDir returns the environment variable name and the directory
+// CurrentBinDir returns the environment variable name and the directory
 // where the Kubernetes server binaries are located.
-func currentBinDir() (envName, content string) {
+func CurrentBinDir() (envName, content string) {
 	envName = "KUBERNETES_SERVER_BIN_DIR"
 	content, _ = os.LookupEnv(envName)
 	return
 }
 
-// makeGUPodWithDownwardAPI creates a Guaranteed pod spec with CPU (request == limit (>= 1 full CPU))
+// MakeGUPodWithDownwardAPI creates a Guaranteed pod spec with CPU (request == limit (>= 1 full CPU))
 // and a DownwardAPI volume that exposes the assigned.cpuset resource field.
 // The container name is configurable so multiple pods can have distinct container names.
-func makeGUPodWithDownwardAPI(podName, containerName string, cpuRequest string) *v1.Pod {
+func MakeGUPodWithDownwardAPI(podName, containerName string, cpuRequest string) *v1.Pod {
 	return &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: podName,
@@ -123,9 +123,9 @@ func makeGUPodWithDownwardAPI(podName, containerName string, cpuRequest string) 
 	}
 }
 
-// createPodAndWaitForRunning creates a pod and waits for it to reach Running state.
+// CreatePodAndWaitForRunning creates a pod and waits for it to reach Running state.
 // Returns the created pod object.
-func createPodAndWaitForRunning(tCtx ktesting.TContext, pod *v1.Pod) *v1.Pod {
+func CreatePodAndWaitForRunning(tCtx ktesting.TContext, pod *v1.Pod) *v1.Pod {
 	tCtx.Helper()
 	namespace := tCtx.Namespace()
 
@@ -140,9 +140,9 @@ func createPodAndWaitForRunning(tCtx ktesting.TContext, pod *v1.Pod) *v1.Pod {
 	return createdPod
 }
 
-// hasAssignedCpusetDownwardAPIItem checks if the pod spec contains the assigned.cpuset
+// HasAssignedCpusetDownwardAPIItem checks if the pod spec contains the assigned.cpuset
 // DownwardAPI volume file item.
-func hasAssignedCpusetDownwardAPIItem(pod *v1.Pod) bool {
+func HasAssignedCpusetDownwardAPIItem(pod *v1.Pod) bool {
 	for _, vol := range pod.Spec.Volumes {
 		if vol.DownwardAPI != nil {
 			for _, item := range vol.DownwardAPI.Items {
@@ -155,8 +155,8 @@ func hasAssignedCpusetDownwardAPIItem(pod *v1.Pod) bool {
 	return false
 }
 
-// execInContainer executes a command inside a container and returns the stdout output.
-func execInContainer(tCtx ktesting.TContext, config *rest.Config, pod *v1.Pod, containerName string, command ...string) (string, error) {
+// ExecInContainer executes a command inside a container and returns the stdout output.
+func ExecInContainer(tCtx ktesting.TContext, config *rest.Config, pod *v1.Pod, containerName string, command ...string) (string, error) {
 	tCtx.Helper()
 
 	client := tCtx.Client()
@@ -193,27 +193,27 @@ func execInContainer(tCtx ktesting.TContext, config *rest.Config, pod *v1.Pod, c
 
 // Cpuset verification helpers
 
-// getAssignedCpusetFromContainer reads the assigned cpuset from the DownwardAPI volume file
+// GetAssignedCpusetFromContainer reads the assigned cpuset from the DownwardAPI volume file
 // inside the container. It execs into the container and reads the file at /podinfo/assigned_cpuset_<containerName>.
 // Returns the cpuset value as a string (e.g. "1-2") or an error if the file is not readable.
-func getAssignedCpusetFromContainer(tCtx ktesting.TContext, config *rest.Config, pod *v1.Pod, containerName string) (string, error) {
+func GetAssignedCpusetFromContainer(tCtx ktesting.TContext, config *rest.Config, pod *v1.Pod, containerName string) (string, error) {
 	tCtx.Helper()
 	filePath := fmt.Sprintf("/podinfo/assigned_cpuset_%s", containerName)
-	output, err := execInContainer(tCtx, config, pod, containerName, "/bin/sh", "-c", fmt.Sprintf("cat %s", filePath))
+	output, err := ExecInContainer(tCtx, config, pod, containerName, "/bin/sh", "-c", fmt.Sprintf("cat %s", filePath))
 	if err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(output), nil
 }
 
-// verifyCpusetVisible verifies that the assigned.cpuset value is visible (non-empty) in the
+// VerifyCpusetVisible verifies that the assigned.cpuset value is visible (non-empty) in the
 // DownwardAPI volume file inside the container. It retries with Eventually because the kubelet
 // may need time to update the DownwardAPI volume after the pod starts.
 // TODO: Reverify the Timeout value, and Eventually Period
-func verifyCpusetVisible(tCtx ktesting.TContext, config *rest.Config, pod *v1.Pod, containerName string) {
+func VerifyCpusetVisible(tCtx ktesting.TContext, config *rest.Config, pod *v1.Pod, containerName string) {
 	tCtx.Helper()
 	tCtx.Eventually(func(tCtx ktesting.TContext) string {
-		cpuset, err := getAssignedCpusetFromContainer(tCtx, config, pod, containerName)
+		cpuset, err := GetAssignedCpusetFromContainer(tCtx, config, pod, containerName)
 		if err != nil {
 			tCtx.Logf("Error reading cpuset from container %s (will retry): %v", containerName, err)
 			return ""
@@ -223,15 +223,15 @@ func verifyCpusetVisible(tCtx ktesting.TContext, config *rest.Config, pod *v1.Po
 		"assigned.cpuset should be visible in DownwardAPI volume when feature gate is ON")
 }
 
-// verifyCpusetNotVisible verifies that the assigned.cpuset value is NOT visible in the
+// VerifyCpusetNotVisible verifies that the assigned.cpuset value is NOT visible in the
 // DownwardAPI volume file inside the container (file should not exist or be empty).
 // It retries with Eventually because the kubelet may need time to reconcile the pod
 // after a restart (e.g., after a feature gate toggle).
-func verifyCpusetNotVisible(tCtx ktesting.TContext, config *rest.Config, pod *v1.Pod, containerName string) {
+func VerifyCpusetNotVisible(tCtx ktesting.TContext, config *rest.Config, pod *v1.Pod, containerName string) {
 	tCtx.Helper()
 	filePath := fmt.Sprintf("/podinfo/assigned_cpuset_%s", containerName)
 	tCtx.Eventually(func(tCtx ktesting.TContext) string {
-		output, err := execInContainer(tCtx, config, pod, containerName, "/bin/sh", "-c",
+		output, err := ExecInContainer(tCtx, config, pod, containerName, "/bin/sh", "-c",
 			fmt.Sprintf("cat %s 2>&1 || true", filePath))
 		if err != nil {
 			// Kubelet may not have reconciled the pod yet after restart.
