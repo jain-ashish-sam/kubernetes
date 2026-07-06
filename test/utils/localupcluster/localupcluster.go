@@ -351,6 +351,14 @@ type ModifyOptions struct {
 
 	// FeatureGatesByComponent specifies feature gates to apply to component command line.
 	FeatureGatesByComponent map[ClusterComponentName]string
+
+	// ModifyFlagsByComponent modifies command-line flags for specific components.
+	// The key is the flag name (e.g., "--cpu-manager-policy-options"), the value is
+	// the value part only (e.g., "CPUManagerPolicyAlphaOptions=true"), not the full token.
+	// If the value is empty "":
+	//   - If the flag exists in the command line, it is deleted.
+	//   - If the flag doesn't exist, it is appended as a bare flag (e.g., "--reserved").
+	ModifyFlagsByComponent map[ClusterComponentName]map[string]string
 }
 
 func (m ModifyOptions) GetComponentFile(component ClusterComponentName) string {
@@ -375,7 +383,8 @@ func (c *Cluster) Modify(tCtx ktesting.TContext, state string, options ModifyOpt
 	tCtx.Helper()
 
 	restore := ModifyOptions{
-		FileByComponent: make(map[ClusterComponentName]string),
+		FileByComponent:        make(map[ClusterComponentName]string),
+		ModifyFlagsByComponent:  make(map[ClusterComponentName]map[string]string),
 	}
 
 	updated := make(map[ClusterComponentName]*Cmd)
@@ -385,7 +394,7 @@ func (c *Cluster) Modify(tCtx ktesting.TContext, state string, options ModifyOpt
 	// apiserver they depend on.
 	for _, component := range slices.Backward(KubeClusterComponents) {
 		fileName := options.GetComponentFile(component)
-		if fileName == "" && options.FeatureGatesByComponent[component] == "" {
+		if fileName == "" && options.FeatureGatesByComponent[component] == "" && len(options.ModifyFlagsByComponent[component]) == 0 {
 			continue
 		}
 		tCtx := tCtx.WithStep(fmt.Sprintf("stop %s", component))
@@ -433,6 +442,10 @@ func (c *Cluster) Modify(tCtx ktesting.TContext, state string, options ModifyOpt
 				merged, err := mergeFeatureGatesFlags(cmd.CommandLine, featureGates)
 				tCtx.ExpectNoError(err, "merge feature gates %s into %s command line", featureGates, component)
 				cmd.CommandLine = merged
+			}
+			// Apply flag modifications.
+			if flagsToModify, ok := options.ModifyFlagsByComponent[component]; ok && len(flagsToModify) > 0 {
+				cmd.CommandLine, restore.ModifyFlagsByComponent[component] = modifyFlags(cmd.CommandLine, flagsToModify)
 			}
 			c.runComponentWithRetry(tCtx, component, cmd)
 		}
@@ -655,4 +668,120 @@ func mergeFeatureGatesFlags(cmdLine []string, featureGates string) ([]string, er
 		return slices.Insert(out, insertIdx, flag), nil
 	}
 	return append(out, flag), nil
+}
+
+// modifyFlags_old is the previous implementation of modifyFlags that uses full tokens
+// as values. Kept for reference.
+func modifyFlags_old(cmdLine []string, flagsToModify map[string]string, restore map[string]string) []string {
+	if restore == nil {
+		restore = make(map[string]string)
+	}
+	newCmdLine := make([]string, 0, len(cmdLine))
+	modified := make(map[string]bool) // track which flags were found
+
+	for _, token := range cmdLine {
+		flagName, _, hasEquals := strings.Cut(token, "=")
+		if !hasEquals {
+			if newVal, ok := flagsToModify[token]; ok {
+				restore[token] = token
+				modified[token] = true
+				if newVal == "" {
+					continue
+				}
+				newCmdLine = append(newCmdLine, newVal)
+				continue
+			}
+			newCmdLine = append(newCmdLine, token)
+			continue
+		}
+		if newVal, ok := flagsToModify[flagName]; ok {
+			restore[flagName] = token
+			modified[flagName] = true
+			if newVal == "" {
+				continue
+			}
+			newCmdLine = append(newCmdLine, newVal)
+			continue
+		}
+		newCmdLine = append(newCmdLine, token)
+	}
+
+	for flagName, newVal := range flagsToModify {
+		if !modified[flagName] && newVal != "" {
+			newCmdLine = append(newCmdLine, newVal)
+			restore[flagName] = ""
+		}
+	}
+
+	return newCmdLine
+}
+
+// modifyFlags modifies command-line flags in cmdLine according to flagsToModify.
+// The key is the flag name (e.g., "--cpu-manager-policy-options"), the value is
+// the value part only (e.g., "CPUManagerPolicyAlphaOptions=true").
+//
+// If the value is empty "":
+//   - If the flag exists in the command line, it is deleted.
+//   - If the flag doesn't exist, it is appended as a bare flag (e.g., "--reserved").
+//
+// If the value is non-empty, the flag is set to flagName=value (or replaced if it exists).
+//
+// Returns the modified command line and a restore map populated with the original value
+// for each modified flag:
+//   - For --flag=value flags: the original value part.
+//   - For removal of bare-flags: "" (so restore adds it back as a bare flag).
+//   - For newly added flags: "" (so restore deletes them).
+func modifyFlags(cmdLine []string, flagsToModify map[string]string) ([]string, map[string]string) {
+	restore := make(map[string]string)
+	newCmdLine := make([]string, 0, len(cmdLine))
+	modified := make(map[string]bool) // track which flags were found
+
+	for _, token := range cmdLine {
+		flagName, origValue, hasEquals := strings.Cut(token, "=")
+		if !hasEquals {
+			// Token has no '=' : could be binary path, sudo, or a bare flag.
+			// If it matches a key in the modify map, it must be a bare flag
+			// being deleted (newVal is "").
+			if _, ok := flagsToModify[token]; ok {
+				restore[token] = ""
+				modified[token] = true
+				continue // drop the bare flag
+			}
+			// Not a flag to modify, keep as-is.
+			newCmdLine = append(newCmdLine, token)
+			continue
+		}
+		// Token has '=' : flagName is the key.
+		if newVal, ok := flagsToModify[flagName]; ok {
+			// Store original value for restore.
+			restore[flagName] = origValue
+			modified[flagName] = true
+			if newVal == "" {
+				// Delete the flag.
+				continue
+			}
+			// Replace with flagName=newVal.
+			newCmdLine = append(newCmdLine, flagName+"="+newVal)
+			continue
+		}
+		// Not a flag to modify, keep as-is.
+		newCmdLine = append(newCmdLine, token)
+	}
+
+	// Handle flags that were requested but not found in the command line.
+	for flagName, newVal := range flagsToModify {
+		if !modified[flagName] {
+			if newVal == "" {
+				// Flag doesn't exist and value is empty : add as bare flag.
+				newCmdLine = append(newCmdLine, flagName)
+			} else {
+				// Flag doesn't exist and value is non-empty : add as flag=value.
+				newCmdLine = append(newCmdLine, flagName+"="+newVal)
+			}
+			// Mark as "" in restore (so restore will delete it if it exists)
+			restore[flagName] = ""
+		}
+	}
+
+	return newCmdLine, restore
 }

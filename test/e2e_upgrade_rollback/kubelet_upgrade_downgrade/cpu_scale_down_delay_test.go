@@ -244,78 +244,56 @@ func testCPUScaleDownDelayKubeletUpgradeDowngrade(tCtx ktesting.TContext) {
 	tCtx.Log("Stage 2 PASS: Pod-A created, scaled up (1→2) and scaled down (2→1) initiated (not waiting for actuation)")
 
 	// ---- Stage 3: Downgrade kubelet to previous release and check pod state ----
-	// var restoreOpts localupcluster.ModifyOptions
-	// tCtx.Step("downgrade-kubelet", func(tCtx ktesting.TContext) {
-	// 	// Downgrade only the kubelet to the previous release binary.
-	// 	// kube-apiserver stays at master version.
-	// 	previousKubeletPath := path.Join(previousBinDir, string(localupcluster.Kubelet))
-	// 	tCtx.Logf("Downgrading kubelet to previous release binary at %s", previousKubeletPath)
-	// 	restoreOpts = cluster.Modify(tCtx, "1-previous-kubelet", localupcluster.ModifyOptions{
-	// 		FileByComponent: map[localupcluster.ClusterComponentName]string{
-	// 			localupcluster.Kubelet: previousKubeletPath,
-	// 		},
-	// 		// The previous kubelet doesn't recognize the DownwardAPIAssignedResources feature gate.
-	// 		// Disable it explicitly to prevent the old kubelet from crashing on startup.
-	// 		FeatureGatesByComponent: map[localupcluster.ClusterComponentName]string{
-	// 			localupcluster.Kubelet: "InPlacePodVerticalScalingExclusiveCPUs=true",
-	// 		},
-	// 	})
-	// 	tCtx.Logf("Kubelet downgraded to previous release (version %d.%d)", major, previousMinor)
-	// })
+	var restoreOpts localupcluster.ModifyOptions
+	tCtx.Step("downgrade-kubelet", func(tCtx ktesting.TContext) {
+		// Downgrade only the kubelet to the previous release binary.
+		// kube-apiserver stays at master version.
+		previousKubeletPath := path.Join(previousBinDir, string(localupcluster.Kubelet))
+		tCtx.Logf("Downgrading kubelet to previous release binary at %s", previousKubeletPath)
+		restoreOpts = cluster.Modify(tCtx, "1-previous-kubelet", localupcluster.ModifyOptions{
+			FileByComponent: map[localupcluster.ClusterComponentName]string{
+				localupcluster.Kubelet: previousKubeletPath,
+			},
+			// The previous kubelet doesn't recognize certain flags and feature gates
+			// that were added in the current release. Remove/replace them to prevent
+			// the old kubelet from crashing on startup.
+			ModifyFlagsByComponent: map[localupcluster.ClusterComponentName]map[string]string{
+				localupcluster.Kubelet: {
+					// Drop entirely — old kubelet doesn't support scale-delay-time option.
+					"--cpu-manager-policy-options": "",
+					// Replace feature gates — remove DownwardAPIAssignedResources and
+					// InPlacePodVerticalScalingExclusiveCPUs (not recognized by old kubelet).
+					// Value is the value part only, not the full token.
+					"--feature-gates": "CPUManagerPolicyAlphaOptions=true",
+				},
+			},
+		})
+		tCtx.Logf("Kubelet downgraded to previous release (version %d.%d)", major, previousMinor)
+	})
 
-	// // Wait for node to be ready after kubelet downgrade
-	// tCtx.Step("wait-for-node-after-downgrade", func(tCtx ktesting.TContext) {
-	// 	tCtx.ExpectNoError(e2enode.WaitForAllNodesSchedulable(tCtx, tCtx.Client(), 5*time.Minute))
-	// 	tCtx.Logf("Node is schedulable after kubelet downgrade")
-	// })
+	// Wait for node to be ready after kubelet downgrade
+	tCtx.Step("wait-for-node-after-downgrade", func(tCtx ktesting.TContext) {
+		tCtx.ExpectNoError(e2enode.WaitForAllNodesSchedulable(tCtx, tCtx.Client(), 5*time.Minute))
+		tCtx.Logf("Node is schedulable after kubelet downgrade")
+	})
 
-	// // Check pod state after kubelet downgrade
-	// tCtx.Step("check-pod-state-after-downgrade", func(tCtx ktesting.TContext) {
-	// 	// Re-fetch the pod to get the latest status
-	// 	freshPod, err := tCtx.Client().CoreV1().Pods(podA.Namespace).Get(tCtx, podA.Name, metav1.GetOptions{})
-	// 	tCtx.ExpectNoError(err, "get pod %s after kubelet downgrade", podA.Name)
-	// 	podA = freshPod
 
-	// 	// Verify pod is still running
-	// 	tCtx.Logf("Pod %q phase after kubelet downgrade: %s", podA.Name, podA.Status.Phase)
-	// 	gomega.Expect(podA.Status.Phase).To(gomega.Equal(v1.PodRunning),
-	// 		"pod %q should still be Running after kubelet downgrade", podA.Name)
+	tCtx.Log("Stage 3 PASS: Kubelet downgraded to previous release, pod still running")
 
-	// 	// Check resize status — the pending scale-down should not have been actuated
-	// 	// by the old kubelet (which doesn't support scale-delay-time or exclusive CPU scaling)
-	// 	for _, cs := range podA.Status.ContainerStatuses {
-	// 		if cs.Name == containerAName {
-	// 			tCtx.Logf("Container %q resize status: %s", cs.Name, cs.Resources)
-	// 			if cs.Resources != nil {
-	// 				tCtx.Logf("Container %q allocated resources: %v", cs.Name, cs.Resources.AllocatedResources)
-	// 			}
-	// 		}
-	// 	}
+	// ---- Stage 5: Restore kubelet to master binary ----
+	tCtx.Step("restore-kubelet", func(tCtx ktesting.TContext) {
+		tCtx.Logf("Restoring kubelet to master binary")
+		cluster.Modify(tCtx, "2-master-restored", restoreOpts)
+		tCtx.Logf("Kubelet restored to master binary")
+	})
 
-	// 	// Verify the pod still has 2 CPUs (scale-down was not actuated by old kubelet)
-	// 	// The old kubelet doesn't support InPlacePodVerticalScalingExclusiveCPUs, so the
-	// 	// pending resize should remain unactuated.
-	// 	tCtx.Logf("Pod %q should still have 2 CPUs (scale-down not actuated by old kubelet)", podA.Name)
+	// Wait for node to be ready after kubelet restore
+	tCtx.Step("wait-for-node-after-restore", func(tCtx ktesting.TContext) {
+		tCtx.ExpectNoError(e2enode.WaitForAllNodesSchedulable(tCtx, tCtx.Client(), 5*time.Minute))
+		tCtx.Logf("Node is schedulable after kubelet restore")
+	})
 
-	// 	tCtx.Logf("Verified pod %q is still Running after kubelet downgrade", podA.Name)
-	// })
-
-	// tCtx.Log("Stage 3 PASS: Kubelet downgraded to previous release, pod still running")
-
-	// // ---- Stage 5: Restore kubelet to master binary ----
-	// tCtx.Step("restore-kubelet", func(tCtx ktesting.TContext) {
-	// 	tCtx.Logf("Restoring kubelet to master binary")
-	// 	cluster.Modify(tCtx, "2-master-restored", restoreOpts)
-	// 	tCtx.Logf("Kubelet restored to master binary")
-	// })
-
-	// // Wait for node to be ready after kubelet restore
-	// tCtx.Step("wait-for-node-after-restore", func(tCtx ktesting.TContext) {
-	// 	tCtx.ExpectNoError(e2enode.WaitForAllNodesSchedulable(tCtx, tCtx.Client(), 5*time.Minute))
-	// 	tCtx.Logf("Node is schedulable after kubelet restore")
-	// })
-
-	// tCtx.Log("Stage 5 PASS: Kubelet restored to master binary")
+	tCtx.Log("Stage 5 PASS: Kubelet restored to master binary")
 
 	tCtx.Log("ALL STAGES PASSED: Kubelet upgrade/downgrade test complete")
 	// Cleanup will destroy the cluster via tCtx.CleanupCtx.

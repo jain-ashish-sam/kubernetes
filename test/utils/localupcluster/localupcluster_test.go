@@ -18,6 +18,7 @@ package localupcluster
 
 import (
 	"reflect"
+	"slices"
 	"testing"
 
 	"k8s.io/component-base/featuregate"
@@ -159,6 +160,130 @@ func TestFilterLockedFeatureGates(t *testing.T) {
 			if got != tc.want {
 				t.Errorf("filterLockedFeatureGates(%q) = %q, want %q", tc.featureGates, got, tc.want)
 			}
+		})
+	}
+}
+
+// assertSortedEqual compares two string slices after sorting them, so that
+// flag order differences don't cause failures.
+func assertSortedEqual(t *testing.T, want, got []string) {
+	t.Helper()
+	wantSorted := append([]string(nil), want...)
+	gotSorted := append([]string(nil), got...)
+	slices.Sort(wantSorted)
+	slices.Sort(gotSorted)
+	if !reflect.DeepEqual(wantSorted, gotSorted) {
+		t.Errorf("sorted comparison failed:\n want (sorted): %q\n got  (sorted): %q", wantSorted, gotSorted)
+	}
+}
+
+func TestModifyFlags(t *testing.T) {
+	for name, tc := range map[string]struct {
+		cmdLine       []string
+		flagsToModify map[string]string
+		wantModified  []string
+		wantRestore   map[string]string
+	}{
+		"replace-existing-flag-value": {
+			cmdLine: []string{"sudo", "-E", "/path/to/kubelet", "--v=3", "--cpu-manager-policy=static", "--kube-reserved=cpu=1,memory=1Gi"},
+			flagsToModify: map[string]string{
+				"--cpu-manager-policy": "none",
+			},
+			wantModified: []string{"sudo", "-E", "/path/to/kubelet", "--v=3", "--cpu-manager-policy=none", "--kube-reserved=cpu=1,memory=1Gi"},
+			wantRestore:  map[string]string{"--cpu-manager-policy": "static"},
+		},
+		"delete-existing-flag": {
+			cmdLine: []string{"sudo", "-E", "/path/to/kubelet", "--v=3", "--cpu-manager-policy-options=scale-delay-time=10s", "--cpu-manager-policy=static"},
+			flagsToModify: map[string]string{
+				"--cpu-manager-policy-options": "",
+			},
+			wantModified: []string{"sudo", "-E", "/path/to/kubelet", "--v=3", "--cpu-manager-policy=static"},
+			wantRestore:  map[string]string{"--cpu-manager-policy-options": "scale-delay-time=10s"},
+		},
+		"add-new-flag-with-value": {
+			cmdLine: []string{"sudo", "-E", "/path/to/kubelet", "--v=3"},
+			flagsToModify: map[string]string{
+				"--kube-reserved": "cpu=1,memory=1Gi",
+			},
+			wantModified: []string{"sudo", "-E", "/path/to/kubelet", "--v=3", "--kube-reserved=cpu=1,memory=1Gi"},
+			wantRestore:  map[string]string{"--kube-reserved": ""},
+		},
+		"add-new-bare-flag": {
+			cmdLine: []string{"sudo", "-E", "/path/to/kubelet", "--v=3"},
+			flagsToModify: map[string]string{
+				"--reserved": "",
+			},
+			wantModified: []string{"sudo", "-E", "/path/to/kubelet", "--v=3", "--reserved"},
+			wantRestore:  map[string]string{"--reserved": ""},
+		},
+		"delete-existing-bare-flag": {
+			cmdLine: []string{"sudo", "-E", "/path/to/kubelet", "--v=3", "--reserved", "--cpu-manager-policy=static"},
+			flagsToModify: map[string]string{
+				"--reserved": "",
+			},
+			wantModified: []string{"sudo", "-E", "/path/to/kubelet", "--v=3", "--cpu-manager-policy=static"},
+			wantRestore:  map[string]string{"--reserved": ""},
+		},
+		"multiple-modifications": {
+			cmdLine: []string{
+				"sudo", "-E", "/path/to/kubelet",
+				"--v=3",
+				"--cpu-manager-policy=static",
+				"--cpu-manager-policy-options=scale-delay-time=10s",
+				"--kube-reserved=cpu=1,memory=1Gi",
+				"--system-reserved=cpu=1,memory=1Gi",
+			},
+			flagsToModify: map[string]string{
+				"--cpu-manager-policy-options": "",
+				"--cpu-manager-policy":         "none",
+			},
+			wantModified: []string{
+				"sudo", "-E", "/path/to/kubelet",
+				"--v=3",
+				"--cpu-manager-policy=none",
+				"--kube-reserved=cpu=1,memory=1Gi",
+				"--system-reserved=cpu=1,memory=1Gi",
+			},
+			wantRestore: map[string]string{
+				"--cpu-manager-policy-options": "scale-delay-time=10s",
+				"--cpu-manager-policy":         "static",
+			},
+		},
+		"no-matching-flags-add-new": {
+			cmdLine: []string{"sudo", "-E", "/path/to/kubelet", "--v=3"},
+			flagsToModify: map[string]string{
+				"--nonexistent": "some-value",
+			},
+			wantModified: []string{"sudo", "-E", "/path/to/kubelet", "--v=3", "--nonexistent=some-value"},
+			wantRestore:  map[string]string{"--nonexistent": ""},
+		},
+		"empty-flags-to-modify": {
+			cmdLine:       []string{"sudo", "-E", "/path/to/kubelet", "--v=3"},
+			flagsToModify: map[string]string{},
+			wantModified:  []string{"sudo", "-E", "/path/to/kubelet", "--v=3"},
+			wantRestore:   map[string]string{},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			// Snapshot input to detect accidental mutation.
+			cmdLineCopy := append([]string(nil), tc.cmdLine...)
+
+			gotModified, gotRestore := modifyFlags(tc.cmdLine, tc.flagsToModify)
+
+			if !reflect.DeepEqual(gotModified, tc.wantModified) {
+				t.Errorf("modified cmdLine mismatch:\n got:  %q\n want: %q", gotModified, tc.wantModified)
+			}
+			if !reflect.DeepEqual(gotRestore, tc.wantRestore) {
+				t.Errorf("restore map mismatch:\n got:  %v\n want: %v", gotRestore, tc.wantRestore)
+			}
+			if !reflect.DeepEqual(tc.cmdLine, cmdLineCopy) {
+				t.Errorf("input slice was mutated:\n got:  %q\n want: %q", tc.cmdLine, cmdLineCopy)
+			}
+
+			// Verify restore round-trip: applying restore should produce the
+			// original cmdLine (order may differ, so compare sorted).
+			restored, _ := modifyFlags(gotModified, gotRestore)
+			assertSortedEqual(t, tc.cmdLine, restored)
 		})
 	}
 }
