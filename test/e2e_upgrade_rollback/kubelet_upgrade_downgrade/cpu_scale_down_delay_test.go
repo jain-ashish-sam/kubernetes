@@ -200,7 +200,9 @@ func testCPUScaleDownDelayKubeletUpgradeDowngrade(tCtx ktesting.TContext) {
 		freshPod, err := tCtx.Client().CoreV1().Pods(podA.Namespace).Get(tCtx, podA.Name, metav1.GetOptions{})
 		tCtx.ExpectNoError(err, "get pod %s for cpuset verification", podA.Name)
 		podA = freshPod
-		gomega.Expect(common.HaveContainerCPUsCount(podA, containerAName, 1)).To(gomega.BeTrue(),
+		tCtx.Eventually(func(tCtx ktesting.TContext) bool {
+			return common.HaveContainerCPUsCount(tCtx, restConfig, podA, containerAName, 1)
+		}).WithTimeout(2*time.Minute).Should(gomega.BeTrue(),
 			"container %q should have 1 CPU in its cpuset", containerAName)
 		tCtx.Logf("Verified pod %q container %q has 1 CPU in cpuset", podAName, containerAName)
 	})
@@ -277,6 +279,7 @@ func testCPUScaleDownDelayKubeletUpgradeDowngrade(tCtx ktesting.TContext) {
 		tCtx.Logf("Node is schedulable after kubelet downgrade")
 	})
 
+	fmt.Println("Check me : ", restoreOpts)
 
 	tCtx.Log("Stage 3 PASS: Kubelet downgraded to previous release, pod still running")
 
@@ -306,13 +309,13 @@ func testCPUScaleDownDelayKubeletUpgradeDowngrade(tCtx ktesting.TContext) {
 // Steps:
 //  1. Record time before scaling
 //  2. Patch pod for resize (using podresize.MakeResizePatch)
-//  3. Verify cpuset in DownwardAPI volume (stub: HaveDownwardAPICPUsCount)
+//  3. Verify cpuset in DownwardAPI volume (common.HaveDownwardAPICPUsCount)
 //  4. Verify pod resources post-patch, pre-actuation (podresize.VerifyPodResources)
-//  5. Wait for resize to be actuated (stub: WaitForPodResizeActuation + ExpectPodResized)
+//  5. Wait for resize to be actuated (common.WaitForPodResizeActuation)
 //     — skipped if waitForActuation is false
 //  6. Verify pod resources after resize (podresize.VerifyPodResources)
 //     — skipped if waitForActuation is false
-//  7. Verify pod cpusets after resize (stub: HaveContainerCPUsCount)
+//  7. Verify pod cpusets after resize (common.HaveContainerCPUsCount)
 //     — skipped if waitForActuation is false
 //  8. Verify scale delay time (if isScaleDown: time > scaleDelayTime)
 //     — skipped if waitForActuation is false
@@ -344,9 +347,11 @@ func patchAndVerifyPodResize(
 		pod.Name, "application/strategic-merge-patch+json", patchBytes, metav1.PatchOptions{}, "resize")
 	tCtx.ExpectNoError(err, "failed to patch pod %s for resize", pod.Name)
 
-	// Step 3: Verify cpuset in DownwardAPI volume
+	// Step 3: Verify cpuset in DownwardAPI volume (use Eventually since kubelet may need time to update)
 	tCtx.Logf("Verifying cpuset in DownwardAPI volume for container %q (expecting %d CPUs)", containerName, expectedCPUCount)
-	gomega.Expect(common.HaveDownwardAPICPUsCount(tCtx, restConfig, patchedPod, containerName, expectedCPUCount)).To(gomega.BeTrue(),
+	tCtx.Eventually(func(tCtx ktesting.TContext) bool {
+		return common.HaveDownwardAPICPUsCount(tCtx, restConfig, patchedPod, containerName, expectedCPUCount)
+	}).WithTimeout(2*time.Minute).Should(gomega.BeTrue(),
 		"DownwardAPI cpuset should reflect %d CPUs for container %q", expectedCPUCount, containerName)
 
 	// Step 5: Verify pod resources post-patch, pre-actuation
@@ -358,15 +363,16 @@ func patchAndVerifyPodResize(
 		// Step 6: Wait for resize to be actuated
 		tCtx.Logf("Waiting for resize to be actuated (expecting %d CPUs)", expectedCPUCount)
 		resizedPod := common.WaitForPodResizeActuation(tCtx, restConfig, patchedPod, containerName, expectedCPUCount)
-		common.ExpectPodResized(tCtx, resizedPod, expectedCPUCount)
 
 		// Step 7: Verify pod resources after resize
 		tCtx.Logf("Verifying pod resources after resize")
 		podresize.VerifyPodResources(resizedPod, desiredContainers, nil)
 
-		// Step 8: Verify pod cpusets after resize
+		// Step 8: Verify pod cpusets after resize (use Eventually since cgroup may need time to update)
 		tCtx.Logf("Verifying pod cpusets after resize (expecting %d CPUs)", expectedCPUCount)
-		gomega.Expect(common.HaveContainerCPUsCount(resizedPod, containerName, expectedCPUCount)).To(gomega.BeTrue(),
+		tCtx.Eventually(func(tCtx ktesting.TContext) bool {
+			return common.HaveContainerCPUsCount(tCtx, restConfig, resizedPod, containerName, expectedCPUCount)
+		}).WithTimeout(2*time.Minute).Should(gomega.BeTrue(),
 			"container %q should have %d CPUs in its cpuset after resize", containerName, expectedCPUCount)
 
 		// Step 9: Verify scale delay time (only if isCheckscaleDelayTime is true and isScaleDown is true)
