@@ -207,81 +207,58 @@ func testCPUScaleDownDelayKubeletUpgradeDowngrade(tCtx ktesting.TContext) {
 		tCtx.Logf("Verified pod %q container %q has 1 CPU in cpuset", podAName, containerAName)
 	})
 
-	// Scale up Pod-A (cpu 1→2), then scale down (cpu 2→1) with delay verification
+	// Scale up Pod-A (cpu 1→3), then scale down (cpu 3→2) with delay verification
 	tCtx.Step("scale-up-and-scale-down", func(tCtx ktesting.TContext) {
-		// Scale up: CPU 1 → 2
+		// Scale up: CPU 1 → 3
 		currentContainers := patchAndVerifyPodResize(
 			tCtx, restConfig, podA, containerAName,
 			originalContainers, // containers before resize (1 CPU)
-			[]podresize.ResizableContainerInfo{ // desired containers (2 CPUs)
+			[]podresize.ResizableContainerInfo{ // desired containers (3 CPUs)
 				{
 					Name: containerAName,
 					Resources: &cgroups.ContainerResources{
-						CPUReq: "2000m", CPULim: "2000m",
+						CPUReq: "3000m", CPULim: "3000m",
 						MemReq: "200Mi", MemLim: "200Mi",
 					},
 					HasExclusiveCPUs: true,
 				},
 			},
-			2,              // expected CPU count after resize
+			3,              // expected CPU count after resize
 			true,           // isCheckscaleDelayTime = true
 			scaleDelayTime, // scale delay time
 			false,          // isScaleDown = false (scale up)
 			true,           // waitForActuation = true (wait for scale-up to complete)
 		)
 
-		// Scale down: CPU 2 → 1 (initiate but don't wait for actuation)
+		// Scale down: CPU 3 → 2 (initiate but don't wait for actuation)
+		scaledDownContainers := []podresize.ResizableContainerInfo{
+			{
+				Name: containerAName,
+				Resources: &cgroups.ContainerResources{
+					CPUReq: "2000m", CPULim: "2000m",
+					MemReq: "200Mi", MemLim: "200Mi",
+				},
+				HasExclusiveCPUs: true,
+			},
+		}
 		patchAndVerifyPodResize(
 			tCtx, restConfig, podA, containerAName,
-			currentContainers,  // containers before resize (2 CPUs)
-			originalContainers, // desired containers (1 CPU, same as original)
-			1,                  // expected CPU count after resize
-			true,               // isCheckscaleDelayTime = true
-			scaleDelayTime,     // scale delay time
-			true,               // isScaleDown = true
-			false,              // waitForActuation = false (don't wait, will check in Stage 3)
+			currentContainers,    // containers before resize (3 CPUs)
+			scaledDownContainers, // desired containers (2 CPUs)
+			2,                    // expected CPU count after resize
+			true,                 // isCheckscaleDelayTime = true
+			scaleDelayTime,       // scale delay time
+			true,                 // isScaleDown = true
+			false,                // waitForActuation = false (don't wait, will check in Stage 3)
 		)
 	})
 
-	tCtx.Log("Stage 2 PASS: Pod-A created, scaled up (1→2) and scaled down (2→1) initiated (not waiting for actuation)")
+	tCtx.Log("Stage 2 PASS: Pod-A created, scaled up (1→3) and scaled down (3→2) initiated (not waiting for actuation)")
 
-	// ---- Stage 3: Downgrade kubelet to previous release and check pod state ----
-	var restoreOpts localupcluster.ModifyOptions
-	tCtx.Step("downgrade-kubelet", func(tCtx ktesting.TContext) {
-		// Downgrade only the kubelet to the previous release binary.
-		// kube-apiserver stays at master version.
-		previousKubeletPath := path.Join(previousBinDir, string(localupcluster.Kubelet))
-		tCtx.Logf("Downgrading kubelet to previous release binary at %s", previousKubeletPath)
-		restoreOpts = cluster.Modify(tCtx, "1-previous-kubelet", localupcluster.ModifyOptions{
-			FileByComponent: map[localupcluster.ClusterComponentName]string{
-				localupcluster.Kubelet: previousKubeletPath,
-			},
-			// The previous kubelet doesn't recognize certain flags and feature gates
-			// that were added in the current release. Remove/replace them to prevent
-			// the old kubelet from crashing on startup.
-			ModifyFlagsByComponent: map[localupcluster.ClusterComponentName]map[string]string{
-				localupcluster.Kubelet: {
-					// Drop entirely — old kubelet doesn't support scale-delay-time option.
-					"--cpu-manager-policy-options": "",
-					// Replace feature gates — remove DownwardAPIAssignedResources and
-					// InPlacePodVerticalScalingExclusiveCPUs (not recognized by old kubelet).
-					// Value is the value part only, not the full token.
-					"--feature-gates": "CPUManagerPolicyAlphaOptions=true",
-				},
-			},
-		})
-		tCtx.Logf("Kubelet downgraded to previous release (version %d.%d)", major, previousMinor)
-	})
+	// ---- Stage 3 & 4: Downgrade kubelet, verify pod state ----
+	restoreOpts := stage3And4KubeletDowngrade(tCtx, restConfig, cluster, podA, containerAName, previousBinDir, major, previousMinor)
 
-	// Wait for node to be ready after kubelet downgrade
-	tCtx.Step("wait-for-node-after-downgrade", func(tCtx ktesting.TContext) {
-		tCtx.ExpectNoError(e2enode.WaitForAllNodesSchedulable(tCtx, tCtx.Client(), 5*time.Minute))
-		tCtx.Logf("Node is schedulable after kubelet downgrade")
-	})
-
-	fmt.Println("Check me : ", restoreOpts)
-
-	tCtx.Log("Stage 3 PASS: Kubelet downgraded to previous release, pod still running")
+	tCtx.Log("Stage 3 & 4 PASS: Kubelet downgraded, pod state verified")
 
 	// ---- Stage 5: Restore kubelet to master binary ----
 	tCtx.Step("restore-kubelet", func(tCtx ktesting.TContext) {
@@ -390,4 +367,151 @@ func patchAndVerifyPodResize(
 
 	// Step 10: Return current container state
 	return desiredContainers
+}
+
+// stage3And4KubeletDowngrade downgrades the kubelet to a previous release binary and
+// verifies the pod's state after the downgrade. It prints the pod spec for visibility
+// and checks that the pod is still running with the correct cpuset.
+//
+// Steps:
+//  1. Downgrade kubelet to previous release binary (via cluster.Modify)
+//  2. Wait for node to be schedulable after downgrade
+//  3. Fetch the pod and print its spec (containers, resources, status, conditions)
+//  4. Verify pod is still running
+//  5. Verify cgroup cpuset is still correct (should be 2 CPUs from the scale-up)
+//
+// Returns the ModifyOptions needed to restore the kubelet in Stage 5.
+func stage3And4KubeletDowngrade(
+	tCtx ktesting.TContext,
+	restConfig *rest.Config,
+	cluster *localupcluster.Cluster,
+	pod *v1.Pod,
+	containerName string,
+	previousBinDir string,
+	major, previousMinor uint,
+) localupcluster.ModifyOptions {
+	tCtx.Helper()
+
+	var restoreOpts localupcluster.ModifyOptions
+
+	// Step 1: Downgrade kubelet to previous release binary
+	tCtx.Step("downgrade-kubelet", func(tCtx ktesting.TContext) {
+		previousKubeletPath := path.Join(previousBinDir, string(localupcluster.Kubelet))
+		tCtx.Logf("Downgrading kubelet to previous release binary at %s", previousKubeletPath)
+		restoreOpts = cluster.Modify(tCtx, "1-previous-kubelet", localupcluster.ModifyOptions{
+			FileByComponent: map[localupcluster.ClusterComponentName]string{
+				localupcluster.Kubelet: previousKubeletPath,
+			},
+			// The previous kubelet doesn't recognize certain flags and feature gates
+			// that were added in the current release. Remove/replace them to prevent
+			// the old kubelet from crashing on startup.
+			ModifyFlagsByComponent: map[localupcluster.ClusterComponentName]map[string]string{
+				localupcluster.Kubelet: {
+					// Drop entirely — old kubelet doesn't support scale-delay-time option.
+					"--cpu-manager-policy-options": "",
+					// Replace feature gates — remove DownwardAPIAssignedResources and
+					// InPlacePodVerticalScalingExclusiveCPUs (not recognized by old kubelet).
+					"--feature-gates": "CPUManagerPolicyAlphaOptions=true",
+				},
+			},
+		})
+		tCtx.Logf("Kubelet downgraded to previous release (version %d.%d)", major, previousMinor)
+	})
+
+	// Step 2: Wait for node to be schedulable after kubelet downgrade
+	tCtx.Step("wait-for-node-after-downgrade", func(tCtx ktesting.TContext) {
+		tCtx.ExpectNoError(e2enode.WaitForAllNodesSchedulable(tCtx, tCtx.Client(), 5*time.Minute))
+		tCtx.Logf("Node is schedulable after kubelet downgrade")
+	})
+
+	// Step 3: Print pod spec (immediately after downgrade)
+	tCtx.Step("print-pod-spec-1", func(tCtx ktesting.TContext) {
+		printPodSpec(tCtx, restConfig, pod, containerName, "immediately after kubelet downgrade")
+	})
+
+	// Step 4: Wait for pod to be Running
+	tCtx.Step("wait-for-pod-running", func(tCtx ktesting.TContext) {
+		tCtx.Eventually(func(tCtx ktesting.TContext) error {
+			freshPod, err := tCtx.Client().CoreV1().Pods(pod.Namespace).Get(tCtx, pod.Name, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			if freshPod.Status.Phase != v1.PodRunning {
+				return fmt.Errorf("pod phase is %s, expected Running", freshPod.Status.Phase)
+			}
+			return nil
+		}).WithTimeout(2*time.Minute).WithPolling(1*time.Second).Should(gomega.Succeed(),
+			"pod should be Running after kubelet downgrade")
+		tCtx.Logf("Pod is Running after kubelet downgrade")
+	})
+
+	// Step 5: Print pod spec again (after pod is Running)
+	tCtx.Step("print-pod-spec-2", func(tCtx ktesting.TContext) {
+		printPodSpec(tCtx, restConfig, pod, containerName, "after pod is Running")
+	})
+
+	// Step 6: Wait 30 seconds to give old kubelet time to process
+	tCtx.Step("wait-30s", func(tCtx ktesting.TContext) {
+		tCtx.Logf("Waiting 30 seconds for old kubelet to process...")
+		time.Sleep(30 * time.Second)
+	})
+
+	// Step 7: Print pod spec again (after 30s wait)
+	tCtx.Step("print-pod-spec-3", func(tCtx ktesting.TContext) {
+		printPodSpec(tCtx, restConfig, pod, containerName, "after 30 second wait")
+	})
+
+	// Step 8: Poll cgroup cpuset every 5 seconds to track changes over time
+	tCtx.Step("poll-cpuset", func(tCtx ktesting.TContext) {
+		tCtx.Logf("Polling cgroup cpuset every 5 seconds for 2 minutes...")
+		for i := 0; i < 240; i++ { // 24 * 5s = 2 minutes
+			freshPod, err := tCtx.Client().CoreV1().Pods(pod.Namespace).Get(tCtx, pod.Name, metav1.GetOptions{})
+			if err != nil {
+				tCtx.Logf("  [%d] Error getting pod: %v", i, err)
+				time.Sleep(5 * time.Second)
+				continue
+			}
+			cpus := common.ReadCgroupCpuset(tCtx, restConfig, freshPod, containerName)
+			tCtx.Logf("  [%d] Cgroup cpuset: %s (%d CPUs)", i, cpus.String(), cpus.Size())
+			time.Sleep(5 * time.Second)
+		}
+		tCtx.Logf("----------------------------")
+	})
+
+	return restoreOpts
+}
+
+// printPodSpec fetches the pod and logs its full spec (containers, resources, status, conditions)
+// along with the cgroup cpuset from within the container.
+func printPodSpec(tCtx ktesting.TContext, restConfig *rest.Config, pod *v1.Pod, containerName, label string) {
+	tCtx.Helper()
+	freshPod, err := tCtx.Client().CoreV1().Pods(pod.Namespace).Get(tCtx, pod.Name, metav1.GetOptions{})
+	tCtx.ExpectNoError(err, "failed to get pod %s", pod.Name)
+	fmt.Println("-----------------------------------------------------------------------")
+	fmt.Println(freshPod)
+	fmt.Println("------------------------------------------------------------------------")
+	tCtx.Logf("=== Pod Spec (%s) ===", label)
+	tCtx.Logf("Pod: %s/%s, Generation: %d, ObservedGeneration: %d",
+		freshPod.Namespace, freshPod.Name, freshPod.Generation, freshPod.Status.ObservedGeneration)
+	tCtx.Logf("Pod Phase: %s, QOSClass: %s", freshPod.Status.Phase, freshPod.Status.QOSClass)
+
+	for _, c := range freshPod.Spec.Containers {
+		tCtx.Logf("Container %q — Requests: %v, Limits: %v",
+			c.Name, c.Resources.Requests, c.Resources.Limits)
+	}
+	for _, cs := range freshPod.Status.ContainerStatuses {
+		tCtx.Logf("ContainerStatus %q — Resources: %v, Ready: %v, RestartCount: %d",
+			cs.Name, cs.Resources, cs.Ready, cs.RestartCount)
+	}
+	tCtx.Logf("Pod Conditions:")
+	for _, cond := range freshPod.Status.Conditions {
+		tCtx.Logf("  Type: %s, Status: %s, Reason: %s, Message: %s",
+			cond.Type, cond.Status, cond.Reason, cond.Message)
+	}
+
+	// Print cgroup cpuset from within the container
+	cpus := common.ReadCgroupCpuset(tCtx, restConfig, freshPod, containerName)
+	tCtx.Logf("Cgroup cpuset: %s (%d CPUs)", cpus.String(), cpus.Size())
+
+	tCtx.Logf("=== End Pod Spec ===")
 }

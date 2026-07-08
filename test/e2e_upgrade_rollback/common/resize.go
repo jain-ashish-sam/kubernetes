@@ -71,6 +71,36 @@ func HaveContainerCPUsCount(tCtx ktesting.TContext, config *rest.Config, pod *v1
 	return cpus.Size() == expectedCount
 }
 
+// ReadCgroupCpuset execs into the container and reads the cgroup cpuset, returning the parsed cpuset.
+// It tries cgroup v2 (cpuset.cpus.effective) first, then falls back to cgroup v1 (cpuset.cpus).
+func ReadCgroupCpuset(tCtx ktesting.TContext, config *rest.Config, pod *v1.Pod, containerName string) cpuset.CPUSet {
+	tCtx.Helper()
+
+	cmd := `cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null || ` +
+		`cat /sys/fs/cgroup/cpuset$(grep '^cpuset:' /proc/self/cgroup | cut -d: -f3)/cpuset.cpus 2>/dev/null`
+
+	stdout, stderr, err := e2epod.Exec(tCtx, e2epod.ExecOptions{
+		Command:       []string{"/bin/sh", "-c", cmd},
+		Namespace:     pod.Namespace,
+		PodName:       pod.Name,
+		ContainerName: containerName,
+		CaptureStdout: true,
+		CaptureStderr: true,
+	})
+	if err != nil {
+		tCtx.Logf("Error reading cgroup cpuset from container %q in pod %q: %v (stderr: %s)",
+			containerName, pod.Name, err, stderr)
+		return cpuset.CPUSet{}
+	}
+
+	cpus, err := cpuset.Parse(strings.TrimSpace(stdout))
+	if err != nil {
+		tCtx.Logf("Error parsing cpuset %q from container %q: %v", stdout, containerName, err)
+		return cpuset.CPUSet{}
+	}
+	return cpus
+}
+
 // HaveDownwardAPICPUsCount verifies that the DownwardAPI volume inside the container
 // reflects the expected number of CPUs. It execs into the container, reads the
 // assigned.cpuset value from the DownwardAPI volume file at
